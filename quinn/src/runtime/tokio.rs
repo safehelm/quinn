@@ -11,7 +11,7 @@ use std::{
         mpsc,
     },
     task::{Context, Poll, Waker, ready},
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use tokio::{
@@ -202,6 +202,9 @@ struct SendJob {
     seals: Vec<proto::SealJob>,
 }
 
+/// How often an idle send or receive thread checks whether its socket is gone
+const THREAD_CHECK: Duration = Duration::from_secs(1);
+
 /// B and C: a thread that seals what was left unsealed and calls sendmsg,
 /// in the order transmits were handed over
 #[derive(Debug)]
@@ -226,7 +229,17 @@ impl SendThread {
         std::thread::Builder::new()
             .name("quinn-send".into())
             .spawn(move || {
-                for mut job in rx {
+                // `me` holds the channel's sender, so the channel never closes:
+                // the thread ends when it holds the last reference, which is
+                // when the socket was dropped, and its copy of the socket with it
+                loop {
+                    let mut job = match rx.recv_timeout(THREAD_CHECK) {
+                        Ok(job) => job,
+                        Err(mpsc::RecvTimeoutError::Timeout) if Arc::strong_count(&me) > 1 => {
+                            continue;
+                        }
+                        Err(_) => return,
+                    };
                     for s in &job.seals {
                         s.seal(&mut job.buf);
                     }
@@ -240,6 +253,9 @@ impl SendThread {
                     loop {
                         match state.send((&sock).into(), &t) {
                             Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                                if Arc::strong_count(&me) == 1 {
+                                    return;
+                                }
                                 state.wait((&sock).into(), true)
                             }
                             _ => break,
@@ -332,6 +348,11 @@ impl RecvThread {
                         match state.recv((&sock).into(), &mut iovs, &mut b.metas) {
                             Ok(n) => break n,
                             Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                                // Only this thread holds it: the socket was dropped
+                                if Arc::strong_count(&me) == 1 {
+                                    return;
+                                }
+                                // Wakes at least once a second (quinn-udp's wait)
                                 state.wait((&sock).into(), false)
                             }
                             Err(_) => {}
@@ -352,7 +373,10 @@ impl RecvThread {
                     {
                         let mut q = me.queue.lock().unwrap();
                         while q.len() >= RECV_QUEUE {
-                            q = me.room.wait(q).unwrap();
+                            q = me.room.wait_timeout(q, THREAD_CHECK).unwrap().0;
+                            if Arc::strong_count(&me) == 1 {
+                                return;
+                            }
                         }
                         q.push_back(b);
                     }
