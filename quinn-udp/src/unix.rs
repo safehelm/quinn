@@ -219,6 +219,16 @@ impl UdpSocketState {
         }
     }
 
+    /// Waits until the socket is writable (`write`) or readable, at most a second
+    pub fn wait(&self, socket: UdpSockRef<'_>, write: bool) {
+        let mut fd = libc::pollfd {
+            fd: socket.0.as_raw_fd(),
+            events: if write { libc::POLLOUT } else { libc::POLLIN },
+            revents: 0,
+        };
+        unsafe { libc::poll(&mut fd, 1, 1000) };
+    }
+
     /// Sends a [`Transmit`] on the given socket without any additional error handling.
     pub fn try_send(&self, socket: UdpSockRef<'_>, transmit: &Transmit<'_>) -> io::Result<()> {
         send(self, socket.0, transmit)
@@ -784,6 +794,7 @@ fn decode_recv(
         addr,
         ecn: EcnCodepoint::from_bits(ecn_bits),
         dst_ip,
+        predecrypted: false,
     }
 }
 

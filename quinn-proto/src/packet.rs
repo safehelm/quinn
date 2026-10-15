@@ -26,6 +26,8 @@ use crate::{
 pub struct PartialDecode {
     plain_header: ProtectedHeader,
     buf: io::Cursor<BytesMut>,
+    /// Opened already by the receive thread: no header protection, plaintext
+    pub(crate) predecrypted: bool,
 }
 
 #[allow(clippy::len_without_is_empty)]
@@ -46,13 +48,27 @@ impl PartialDecode {
             .map(|len| (buf.position() + len) as usize)
             .unwrap_or(dgram_len);
         match dgram_len.cmp(&packet_len) {
-            Ordering::Equal => Ok((Self { plain_header, buf }, None)),
+            Ordering::Equal => Ok((
+                Self {
+                    plain_header,
+                    buf,
+                    predecrypted: false,
+                },
+                None,
+            )),
             Ordering::Less => Err(PacketDecodeError::InvalidHeader(
                 "packet too short to contain payload length",
             )),
             Ordering::Greater => {
                 let rest = Some(buf.get_mut().split_off(packet_len));
-                Ok((Self { plain_header, buf }, rest))
+                Ok((
+                    Self {
+                        plain_header,
+                        buf,
+                        predecrypted: false,
+                    },
+                    rest,
+                ))
             }
         }
     }
@@ -117,6 +133,7 @@ impl PartialDecode {
         let Self {
             plain_header,
             mut buf,
+            predecrypted,
         } = self;
 
         if let Initial(ProtectedInitialHeader {
@@ -143,6 +160,7 @@ impl PartialDecode {
                 }),
                 header_data,
                 payload: bytes,
+                predecrypted: false,
             });
         }
 
@@ -170,7 +188,13 @@ impl PartialDecode {
                 version,
             },
             Short { spin, dst_cid, .. } => {
-                let number = Self::decrypt_header(&mut buf, header_crypto.unwrap())?;
+                let number = match predecrypted {
+                    true => {
+                        let len = PacketNumber::decode_len(buf.get_ref()[0]);
+                        PacketNumber::decode(len, &mut buf)?
+                    }
+                    false => Self::decrypt_header(&mut buf, header_crypto.unwrap())?,
+                };
                 let key_phase = buf.get_ref()[0] & KEY_PHASE_BIT != 0;
                 Header::Short {
                     spin,
@@ -197,6 +221,7 @@ impl PartialDecode {
             header,
             header_data: bytes.split_to(header_len).freeze(),
             payload: bytes,
+            predecrypted,
         })
     }
 
@@ -223,6 +248,8 @@ pub(crate) struct Packet {
     pub(crate) header: Header,
     pub(crate) header_data: Bytes,
     pub(crate) payload: BytesMut,
+    /// Its payload is plaintext already, followed by the tag
+    pub(crate) predecrypted: bool,
 }
 
 impl Packet {
@@ -247,6 +274,7 @@ impl From<InitialPacket> for Packet {
             header: Header::Initial(x.header),
             header_data: x.header_data,
             payload: x.payload,
+            predecrypted: false,
         }
     }
 }
@@ -468,6 +496,21 @@ pub(crate) struct PartialEncode {
 }
 
 impl PartialEncode {
+    /// As `finish`, but leaves the packet unsealed: returns the header length
+    /// and the packet number's offset, for whoever seals it later
+    pub(crate) fn finish_unsealed(self, buf: &mut [u8]) -> Option<(usize, usize)> {
+        let Self { header_len, pn, .. } = self;
+        let (pn_len, write_len) = pn?;
+        let pn_pos = header_len - pn_len;
+        if write_len {
+            let len = buf.len() - header_len + pn_len;
+            assert!(len < 2usize.pow(14)); // Fits in reserved space
+            let mut slice = &mut buf[pn_pos - 2..pn_pos];
+            slice.put_u16(len as u16 | (0b01 << 14));
+        }
+        Some((header_len, pn_pos))
+    }
+
     pub(crate) fn finish(
         self,
         buf: &mut [u8],

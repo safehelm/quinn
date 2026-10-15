@@ -905,6 +905,8 @@ impl ConnectionRef {
         socket: Arc<dyn AsyncUdpSocket>,
         runtime: Arc<dyn Runtime>,
     ) -> Self {
+        let mut conn = conn;
+        conn.set_defer_seal(socket.seal_thread());
         Self(Arc::new(ConnectionInner {
             state: Mutex::new(State {
                 inner: conn,
@@ -926,6 +928,8 @@ impl ConnectionRef {
                 runtime,
                 send_buffer: Vec::new(),
                 buffered_transmit: None,
+                seals: Vec::new(),
+                published_key: None,
             }),
             shared: Shared::default(),
         }))
@@ -1008,6 +1012,10 @@ pub(crate) struct State {
     io_poller: Pin<Box<dyn UdpPoller>>,
     runtime: Arc<dyn Runtime>,
     send_buffer: Vec<u8>,
+    /// Packets in `send_buffer` still to be sealed, by the send thread
+    seals: Vec<proto::SealJob>,
+    /// The receive packet key last given to a decrypting receive thread
+    published_key: Option<usize>,
     /// We buffer a transmit when the underlying I/O would block
     buffered_transmit: Option<proto::Transmit>,
 }
@@ -1022,6 +1030,8 @@ impl State {
             .max_transmit_segments()
             .min(MAX_TRANSMIT_SEGMENTS);
 
+        self.publish_recv_keys();
+
         loop {
             // Retry the last transmit, or get a new one.
             let t = match self.buffered_transmit.take() {
@@ -1034,6 +1044,7 @@ impl State {
                         .poll_transmit(now, max_datagrams, &mut self.send_buffer)
                     {
                         Some(t) => {
+                            self.inner.take_seal_jobs(&mut self.seals);
                             transmits += match t.segment_size {
                                 None => 1,
                                 Some(s) => t.size.div_ceil(s), // round up
@@ -1052,10 +1063,18 @@ impl State {
             }
 
             let len = t.size;
-            let retry = match self
-                .socket
-                .try_send(&udp_transmit(&t, &self.send_buffer[..len]))
-            {
+            let sent = match self.socket.send_thread() {
+                true => self.socket.try_send_owned(
+                    &udp_transmit(&t, &[]),
+                    len,
+                    &mut self.send_buffer,
+                    &mut self.seals,
+                ),
+                false => self
+                    .socket
+                    .try_send(&udp_transmit(&t, &self.send_buffer[..len])),
+            };
+            let retry = match sent {
                 Ok(()) => false,
                 Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => true,
                 Err(e) => return Err(e),
@@ -1079,6 +1098,21 @@ impl State {
         }
 
         Ok(false)
+    }
+
+    /// Gives a decrypting receive thread the receive keys, when they changed
+    fn publish_recv_keys(&mut self) {
+        if !self.socket.decrypt_thread() {
+            return;
+        }
+        let Some(keys) = self.inner.recv_keys() else {
+            return;
+        };
+        let key = Arc::as_ptr(&keys.packet) as *const () as usize;
+        if self.published_key != Some(key) {
+            self.published_key = Some(key);
+            self.socket.set_recv_keys(keys);
+        }
     }
 
     fn forward_endpoint_events(&mut self) {
@@ -1338,4 +1372,4 @@ const MAX_TRANSMIT_DATAGRAMS: usize = 20;
 /// This can be lower than the maximum platform capabilities, to avoid excessive
 /// memory allocations when calling `poll_transmit()`. Benchmarks have shown
 /// that numbers around 10 are a good compromise.
-const MAX_TRANSMIT_SEGMENTS: usize = 10;
+const MAX_TRANSMIT_SEGMENTS: usize = 40;

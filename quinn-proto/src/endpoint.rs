@@ -154,6 +154,22 @@ impl Endpoint {
         data: BytesMut,
         buf: &mut Vec<u8>,
     ) -> Option<DatagramEvent> {
+        self.handle_ext(now, remote, local_ip, ecn, data, buf, false)
+    }
+
+    /// As [`Self::handle`], for a datagram whose short-header packet was
+    /// opened already when `predecrypted`
+    #[allow(clippy::too_many_arguments)]
+    pub fn handle_ext(
+        &mut self,
+        now: Instant,
+        remote: SocketAddr,
+        local_ip: Option<IpAddr>,
+        ecn: Option<EcnCodepoint>,
+        data: BytesMut,
+        buf: &mut Vec<u8>,
+        predecrypted: bool,
+    ) -> Option<DatagramEvent> {
         // Partially decode packet or short-circuit if unable
         let datagram_len = data.len();
         let event = match PartialDecode::new(
@@ -162,13 +178,16 @@ impl Endpoint {
             &self.config.supported_versions,
             self.config.grease_quic_bit,
         ) {
-            Ok((first_decode, remaining)) => DatagramConnectionEvent {
-                now,
-                remote,
-                ecn,
-                first_decode,
-                remaining,
-            },
+            Ok((mut first_decode, remaining)) => {
+                first_decode.predecrypted = predecrypted && !first_decode.has_long_header();
+                DatagramConnectionEvent {
+                    now,
+                    remote,
+                    ecn,
+                    first_decode,
+                    remaining,
+                }
+            }
             Err(PacketDecodeError::UnsupportedVersion {
                 src_cid,
                 dst_cid,

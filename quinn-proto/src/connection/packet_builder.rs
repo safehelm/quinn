@@ -260,12 +260,37 @@ impl PacketBuilder {
 
         buffer.resize(buffer.len() + packet_crypto.tag_len(), 0);
         let encode_start = self.partial_encode.start;
+        // 1-RTT packets under shared keys may be sealed later, elsewhere
+        let deferred = match conn.defer_seal
+            && self.space == SpaceId::Data
+            && space.crypto.is_some()
+        {
+            true => packet_crypto.shared().zip(header_crypto.shared()),
+            false => None,
+        };
         let packet_buf = &mut buffer[encode_start..];
-        self.partial_encode.finish(
-            packet_buf,
-            header_crypto,
-            Some((self.exact_number, packet_crypto)),
-        );
+        match deferred {
+            Some((packet, header)) => {
+                if let Some((header_len, pn_pos)) = self.partial_encode.finish_unsealed(packet_buf)
+                {
+                    let end = buffer.len();
+                    conn.seal_jobs.push(super::SealJob {
+                        start: encode_start,
+                        end,
+                        header_len,
+                        pn_pos,
+                        number: self.exact_number,
+                        packet,
+                        header,
+                    });
+                }
+            }
+            None => self.partial_encode.finish(
+                packet_buf,
+                header_crypto,
+                Some((self.exact_number, packet_crypto)),
+            ),
+        }
 
         let len = buffer.len() - encode_start;
         conn.config.qlog_sink.emit_packet_sent(

@@ -162,6 +162,57 @@ pub trait PacketKey: Send + Sync {
     /// Maximum number of incoming packets that may fail decryption before the connection must be
     /// abandoned
     fn integrity_limit(&self) -> u64;
+    /// The same key, shared, when it can be used from another thread
+    fn shared(&self) -> Option<Arc<dyn PacketKey>> {
+        None
+    }
+    /// Decrypt `payload` (ciphertext and tag) in place; the plaintext's length
+    fn decrypt_in_place(
+        &self,
+        _packet: u64,
+        _header: &[u8],
+        _payload: &mut [u8],
+    ) -> Result<usize, CryptoError> {
+        Err(CryptoError)
+    }
+}
+
+/// A local packet key held in an `Arc`, so a packet built on one thread can
+/// be sealed on another
+pub struct SharedPacketKey(pub Arc<dyn PacketKey>);
+
+impl PacketKey for SharedPacketKey {
+    fn encrypt(&self, packet: u64, buf: &mut [u8], header_len: usize) {
+        self.0.encrypt(packet, buf, header_len)
+    }
+    fn decrypt(
+        &self,
+        packet: u64,
+        header: &[u8],
+        payload: &mut BytesMut,
+    ) -> Result<(), CryptoError> {
+        self.0.decrypt(packet, header, payload)
+    }
+    fn tag_len(&self) -> usize {
+        self.0.tag_len()
+    }
+    fn confidentiality_limit(&self) -> u64 {
+        self.0.confidentiality_limit()
+    }
+    fn integrity_limit(&self) -> u64 {
+        self.0.integrity_limit()
+    }
+    fn shared(&self) -> Option<Arc<dyn PacketKey>> {
+        Some(self.0.clone())
+    }
+    fn decrypt_in_place(
+        &self,
+        packet: u64,
+        header: &[u8],
+        payload: &mut [u8],
+    ) -> Result<usize, CryptoError> {
+        self.0.decrypt_in_place(packet, header, payload)
+    }
 }
 
 /// Keys used to protect packet headers
@@ -172,6 +223,28 @@ pub trait HeaderKey: Send + Sync {
     fn encrypt(&self, pn_offset: usize, packet: &mut [u8]);
     /// The sample size used for this key's algorithm
     fn sample_size(&self) -> usize;
+    /// The same key, shared, when it can be used from another thread
+    fn shared(&self) -> Option<Arc<dyn HeaderKey>> {
+        None
+    }
+}
+
+/// A local header key held in an `Arc`; see [`SharedPacketKey`]
+pub struct SharedHeaderKey(pub Arc<dyn HeaderKey>);
+
+impl HeaderKey for SharedHeaderKey {
+    fn decrypt(&self, pn_offset: usize, packet: &mut [u8]) {
+        self.0.decrypt(pn_offset, packet)
+    }
+    fn encrypt(&self, pn_offset: usize, packet: &mut [u8]) {
+        self.0.encrypt(pn_offset, packet)
+    }
+    fn sample_size(&self) -> usize {
+        self.0.sample_size()
+    }
+    fn shared(&self) -> Option<Arc<dyn HeaderKey>> {
+        Some(self.0.clone())
+    }
 }
 
 /// A key for signing with HMAC-based algorithms

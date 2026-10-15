@@ -243,6 +243,9 @@ pub struct Connection {
     datagrams: DatagramState,
     /// Connection level statistics
     stats: ConnectionStats,
+    /// Leave 1-RTT packets unsealed, for `take_seal_jobs`
+    defer_seal: bool,
+    seal_jobs: Vec<SealJob>,
     /// QUIC version used for the connection.
     version: u32,
 }
@@ -362,6 +365,8 @@ impl Connection {
             rem_cids: CidQueue::new(rem_cid),
             rng,
             stats: ConnectionStats::default(),
+            defer_seal: false,
+            seal_jobs: Vec::new(),
             version,
         };
         if path_validated {
@@ -4140,5 +4145,88 @@ mod tests {
             assert_eq!(negotiate_max_idle_timeout(left, right), result);
             assert_eq!(negotiate_max_idle_timeout(right, left), result);
         }
+    }
+}
+
+/// A 1-RTT packet built but not yet sealed: [`SealJob::seal`] encrypts it and
+/// protects its header, in the transmit's buffer it was built in
+pub struct SealJob {
+    start: usize,
+    end: usize,
+    header_len: usize,
+    pn_pos: usize,
+    number: u64,
+    packet: Arc<dyn crypto::PacketKey>,
+    header: Arc<dyn crypto::HeaderKey>,
+}
+
+impl SealJob {
+    /// Seal the packet in `buf`, the buffer of the transmit it was built in
+    pub fn seal(&self, buf: &mut [u8]) {
+        let p = &mut buf[self.start..self.end];
+        self.packet.encrypt(self.number, p, self.header_len);
+        self.header.encrypt(self.pn_pos, p);
+    }
+}
+
+impl fmt::Debug for SealJob {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SealJob")
+            .field("start", &self.start)
+            .field("end", &self.end)
+            .field("number", &self.number)
+            .finish()
+    }
+}
+
+impl Connection {
+    /// Leave 1-RTT packets unsealed from now on; each `poll_transmit` is then
+    /// followed by `take_seal_jobs`, and its transmit sent only once sealed
+    pub fn set_defer_seal(&mut self, on: bool) {
+        self.defer_seal = on;
+    }
+
+    /// The packets the last `poll_transmit` left unsealed, in its buffer
+    pub fn take_seal_jobs(&mut self, out: &mut Vec<SealJob>) {
+        out.append(&mut self.seal_jobs);
+    }
+}
+
+/// What a receive thread needs to open this connection's 1-RTT packets
+pub struct RecvKeys {
+    /// Header protection key, as the peer applies it
+    pub header: Arc<dyn crypto::HeaderKey>,
+    /// Packet key for the current key phase
+    pub packet: Arc<dyn crypto::PacketKey>,
+    /// The current key phase
+    pub key_phase: bool,
+    /// The largest packet number received so far
+    pub largest: u64,
+    /// The length of this endpoint's connection IDs
+    pub cid_len: usize,
+}
+
+impl fmt::Debug for RecvKeys {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RecvKeys")
+            .field("key_phase", &self.key_phase)
+            .field("largest", &self.largest)
+            .field("cid_len", &self.cid_len)
+            .finish()
+    }
+}
+
+impl Connection {
+    /// The 1-RTT receive keys, once there are some that can be shared
+    pub fn recv_keys(&self) -> Option<RecvKeys> {
+        let space = &self.spaces[SpaceId::Data];
+        let crypto = space.crypto.as_ref()?;
+        Some(RecvKeys {
+            header: crypto.header.remote.shared()?,
+            packet: crypto.packet.remote.shared()?,
+            key_phase: self.key_phase,
+            largest: space.rx_packet,
+            cid_len: self.handshake_cid.len(),
+        })
     }
 }

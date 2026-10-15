@@ -58,6 +58,38 @@ pub trait AsyncUdpSocket: Send + Sync + Debug + 'static {
     /// to register the calling task to be woken when a send should be attempted again.
     fn try_send(&self, transmit: &Transmit) -> io::Result<()>;
 
+    /// Whether transmits go to a send thread, through [`Self::try_send_owned`]
+    fn send_thread(&self) -> bool {
+        false
+    }
+
+    /// Whether that thread also seals the packets left unsealed
+    fn seal_thread(&self) -> bool {
+        false
+    }
+
+    /// Whether a receive thread opens 1-RTT packets, with the keys given here
+    fn decrypt_thread(&self) -> bool {
+        false
+    }
+
+    /// The keys a decrypting receive thread opens packets with
+    fn set_recv_keys(&self, _keys: proto::RecvKeys) {}
+
+    /// Hand `buf[..len]`, sent as `meta` describes (its contents ignored), and
+    /// the packets in it still to seal, to the send thread. On success `buf` and
+    /// `seals` are swapped for empty ones from the thread's pool; on
+    /// `WouldBlock` both are left as they were.
+    fn try_send_owned(
+        &self,
+        _meta: &Transmit,
+        _len: usize,
+        _buf: &mut Vec<u8>,
+        _seals: &mut Vec<proto::SealJob>,
+    ) -> io::Result<()> {
+        Err(io::ErrorKind::Unsupported.into())
+    }
+
     /// Receive UDP datagrams, or register to be woken if receiving may succeed in the future
     fn poll_recv(
         &self,

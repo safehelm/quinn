@@ -104,12 +104,17 @@ pub(super) fn decrypt_packet_body(
         &next_crypto.unwrap().remote
     };
 
-    crypto
-        .decrypt(number, &packet.header_data, &mut packet.payload)
-        .map_err(|_| {
-            trace!("decryption failed with packet number {}", number);
-            None
-        })?;
+    if packet.predecrypted {
+        let plain = packet.payload.len().saturating_sub(crypto.tag_len());
+        packet.payload.truncate(plain);
+    } else {
+        crypto
+            .decrypt(number, &packet.header_data, &mut packet.payload)
+            .map_err(|_| {
+                trace!("decryption failed with packet number {}", number);
+                None
+            })?;
+    }
 
     if !packet.reserved_bits_valid() {
         return Err(Some(TransportError::PROTOCOL_VIOLATION(

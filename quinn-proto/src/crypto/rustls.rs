@@ -152,12 +152,12 @@ impl crypto::Session for TlsSession {
 
         Some(Keys {
             header: KeyPair {
-                local: Box::new(keys.local.header),
-                remote: Box::new(keys.remote.header),
+                local: Box::new(crypto::SharedHeaderKey(std::sync::Arc::new(keys.local.header))),
+                remote: Box::new(crypto::SharedHeaderKey(std::sync::Arc::new(keys.remote.header))),
             },
             packet: KeyPair {
-                local: Box::new(keys.local.packet),
-                remote: Box::new(keys.remote.packet),
+                local: Box::new(crypto::SharedPacketKey(std::sync::Arc::new(keys.local.packet))),
+                remote: Box::new(crypto::SharedPacketKey(std::sync::Arc::new(keys.remote.packet))),
             },
         })
     }
@@ -166,8 +166,8 @@ impl crypto::Session for TlsSession {
         let secrets = self.next_secrets.as_mut()?;
         let keys = secrets.next_packet_keys();
         Some(KeyPair {
-            local: Box::new(keys.local),
-            remote: Box::new(keys.remote),
+            local: Box::new(crypto::SharedPacketKey(std::sync::Arc::new(keys.local))),
+            remote: Box::new(crypto::SharedPacketKey(std::sync::Arc::new(keys.remote))),
         })
     }
 
@@ -626,12 +626,23 @@ impl crypto::PacketKey for Box<dyn PacketKey> {
         header: &[u8],
         payload: &mut BytesMut,
     ) -> Result<(), CryptoError> {
-        let plain = self
-            .decrypt_in_place(packet, header, payload.as_mut())
+        // rustls's own, by name: crypto::PacketKey has a method of this name too
+        let plain = PacketKey::decrypt_in_place(&**self, packet, header, payload.as_mut())
             .map_err(|_| CryptoError)?;
         let plain_len = plain.len();
         payload.truncate(plain_len);
         Ok(())
+    }
+
+    fn decrypt_in_place(
+        &self,
+        packet: u64,
+        header: &[u8],
+        payload: &mut [u8],
+    ) -> Result<usize, CryptoError> {
+        let plain = PacketKey::decrypt_in_place(&**self, packet, header, payload)
+            .map_err(|_| CryptoError)?;
+        Ok(plain.len())
     }
 
     fn tag_len(&self) -> usize {
