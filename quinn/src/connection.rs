@@ -1014,8 +1014,9 @@ pub(crate) struct State {
     send_buffer: Vec<u8>,
     /// Packets in `send_buffer` still to be sealed, by the send thread
     seals: Vec<proto::SealJob>,
-    /// The receive packet key last given to a decrypting receive thread
-    published_key: Option<usize>,
+    /// The receive packet key last given to a decrypting receive thread, and
+    /// the CID it was given for
+    published_key: Option<(usize, proto::ConnectionId)>,
     /// We buffer a transmit when the underlying I/O would block
     buffered_transmit: Option<proto::Transmit>,
 }
@@ -1108,8 +1109,13 @@ impl State {
         let Some(keys) = self.inner.recv_keys() else {
             return;
         };
-        let key = Arc::as_ptr(&keys.packet) as *const () as usize;
+        let key = (Arc::as_ptr(&keys.packet) as *const () as usize, keys.dst_cid);
         if self.published_key != Some(key) {
+            if let Some((_, old)) = self.published_key {
+                if old != key.1 {
+                    self.socket.clear_recv_keys(old);
+                }
+            }
             self.published_key = Some(key);
             self.socket.set_recv_keys(keys);
         }
@@ -1304,6 +1310,9 @@ impl State {
 
 impl Drop for State {
     fn drop(&mut self) {
+        if let Some((_, cid)) = self.published_key {
+            self.socket.clear_recv_keys(cid);
+        }
         if !self.inner.is_drained() {
             // Ensure the endpoint can tidy up
             let _ = self

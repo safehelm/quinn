@@ -1,5 +1,5 @@
 use std::{
-    collections::VecDeque,
+    collections::{HashMap, VecDeque},
     future::Future,
     io::{self, IoSliceMut},
     mem,
@@ -110,7 +110,21 @@ impl AsyncUdpSocket for UdpSocket {
 
     fn set_recv_keys(&self, keys: proto::RecvKeys) {
         if let Some(r) = &self.recv {
-            *r.keys.lock().unwrap() = Some(Arc::new(keys));
+            let mut slot = r.keys.lock().unwrap();
+            let mut map = RecvKeyMap::clone(&slot);
+            map.insert(keys.dst_cid, Arc::new(keys));
+            *slot = Arc::new(map);
+        }
+    }
+
+    fn clear_recv_keys(&self, cid: proto::ConnectionId) {
+        if let Some(r) = &self.recv {
+            let mut slot = r.keys.lock().unwrap();
+            if slot.contains_key(&cid) {
+                let mut map = RecvKeyMap::clone(&slot);
+                map.remove(&cid);
+                *slot = Arc::new(map);
+            }
         }
     }
 
@@ -211,8 +225,9 @@ const THREAD_CHECK: Duration = Duration::from_secs(1);
 struct SendThread {
     tx: mpsc::SyncSender<SendJob>,
     queued: AtomicUsize,
-    /// The one task waiting for room (one connection a socket, in this experiment)
-    waker: Mutex<Option<Waker>>,
+    /// The tasks waiting for room: one a connection, since every connection
+    /// of an endpoint sends on its socket
+    waker: Mutex<Vec<Waker>>,
     free: Mutex<Vec<(Vec<u8>, Vec<proto::SealJob>)>>,
 }
 
@@ -222,7 +237,7 @@ impl SendThread {
         let shared = Arc::new(Self {
             tx,
             queued: AtomicUsize::new(0),
-            waker: Mutex::new(None),
+            waker: Mutex::new(Vec::new()),
             free: Mutex::new(Vec::new()),
         });
         let me = shared.clone();
@@ -265,7 +280,8 @@ impl SendThread {
                     job.seals.clear();
                     me.free.lock().unwrap().push((job.buf, job.seals));
                     me.queued.fetch_sub(1, Ordering::AcqRel);
-                    if let Some(w) = me.waker.lock().unwrap().take() {
+                    let waiting = mem::take(&mut *me.waker.lock().unwrap());
+                    for w in waiting {
                         w.wake();
                     }
                 }
@@ -284,7 +300,12 @@ impl super::UdpPoller for SendQueuePoller {
         if s.queued.load(Ordering::Acquire) < send_queue() {
             return Poll::Ready(Ok(()));
         }
-        *s.waker.lock().unwrap() = Some(cx.waker().clone());
+        {
+            let mut waiting = s.waker.lock().unwrap();
+            if !waiting.iter().any(|w| w.will_wake(cx.waker())) {
+                waiting.push(cx.waker().clone());
+            }
+        }
         match s.queued.load(Ordering::Acquire) < send_queue() {
             true => Poll::Ready(Ok(())),
             false => Poll::Pending,
@@ -309,7 +330,9 @@ struct RecvBatch {
 #[derive(Debug)]
 struct RecvThread {
     decrypt: bool,
-    keys: Mutex<Option<Arc<proto::RecvKeys>>>,
+    /// Each connection's receive keys, by the CID its peer sends to; replaced
+    /// whole on a change, so the thread takes a snapshot a batch
+    keys: Mutex<Arc<RecvKeyMap>>,
     queue: Mutex<VecDeque<RecvBatch>>,
     room: Condvar,
     waker: Mutex<Option<Waker>>,
@@ -324,7 +347,7 @@ impl RecvThread {
     ) -> io::Result<Arc<Self>> {
         let shared = Arc::new(Self {
             decrypt,
-            keys: Mutex::new(None),
+            keys: Mutex::new(Arc::default()),
             queue: Mutex::new(VecDeque::new()),
             room: Condvar::new(),
             waker: Mutex::new(None),
@@ -361,7 +384,7 @@ impl RecvThread {
                     b.next = 0;
                     if me.decrypt {
                         let keys = me.keys.lock().unwrap().clone();
-                        if let Some(keys) = keys {
+                        if !keys.is_empty() {
                             for i in 0..b.n {
                                 let m = &mut b.metas[i];
                                 let off = i * RECV_CHUNK;
@@ -422,26 +445,68 @@ impl RecvThread {
     }
 }
 
+/// Receive keys by the CID the connection's peer sends to
+type RecvKeyMap = HashMap<proto::ConnectionId, Arc<proto::RecvKeys>>;
+
 /// E: opens 1-RTT packets on the receive thread
 #[derive(Default)]
 struct Opener {
-    /// The keys `largest` was last seeded from
-    seeded: Option<usize>,
-    largest: u64,
+    /// Per CID: the packet key `largest` was last seeded from, and the largest
+    /// packet number opened
+    numbers: HashMap<proto::ConnectionId, (usize, u64)>,
     failed: u64,
     opened: u64,
 }
 
 impl Opener {
-    /// Opens every segment of one datagram in place, or none: true when it did
-    fn open(&mut self, keys: &proto::RecvKeys, dgram: &mut [u8], stride: usize) -> bool {
-        let key = Arc::as_ptr(&keys.packet) as *const () as usize;
-        if self.seeded != Some(key) {
-            self.seeded = Some(key);
-            self.largest = self.largest.max(keys.largest);
+    /// Opens every segment of one datagram in place, or none: true when it did.
+    /// A datagram is opened only with the keys of the connection its CID
+    /// names; any other is left exactly as it arrived, for the endpoint.
+    fn open(&mut self, all: &RecvKeyMap, dgram: &mut [u8], stride: usize) -> bool {
+        let Some(cid_len) = all.values().next().map(|k| k.cid_len) else {
+            return false;
+        };
+        let pn_offset = 1 + cid_len;
+        if dgram.len() < pn_offset || dgram[0] & 0x80 != 0 {
+            return false;
         }
+        let cid = proto::ConnectionId::new(&dgram[1..pn_offset]);
+        let Some(keys) = all.get(&cid) else {
+            return false;
+        };
         let stride = if stride == 0 { dgram.len() } else { stride };
-        let pn_offset = 1 + keys.cid_len;
+        // A GRO train is one 5-tuple, but say so before touching any of it
+        let first = &dgram[1..pn_offset];
+        if dgram
+            .chunks(stride)
+            .any(|seg| seg.len() < pn_offset || seg[1..pn_offset] != *first)
+        {
+            return false;
+        }
+        if self.numbers.len() > 2 * all.len() + 16 {
+            self.numbers.retain(|c, _| all.contains_key(c));
+        }
+        let key = Arc::as_ptr(&keys.packet) as *const () as usize;
+        let state = self.numbers.entry(cid).or_insert((0, 0));
+        if state.0 != key {
+            *state = (key, state.1.max(keys.largest));
+        }
+        let mut largest = state.1;
+        let opened = self.open_with(keys, &mut largest, dgram, stride, pn_offset);
+        if let Some(state) = self.numbers.get_mut(&cid) {
+            state.1 = largest;
+        }
+        opened
+    }
+
+    fn open_with(
+        &mut self,
+        keys: &proto::RecvKeys,
+        largest: &mut u64,
+        dgram: &mut [u8],
+        stride: usize,
+        pn_offset: usize,
+    ) -> bool {
         let min = pn_offset + 4 + keys.header.sample_size();
         // Pass 1: every segment a short header of the current phase, or none touched
         let mut unprotected = 0;
@@ -471,12 +536,12 @@ impl Opener {
             for &b in &seg[pn_offset..pn_offset + pn_len] {
                 truncated = (truncated << 8) | u64::from(b);
             }
-            let number = expand_pn(truncated, pn_len, self.largest + 1);
+            let number = expand_pn(truncated, pn_len, *largest + 1);
             let header_len = pn_offset + pn_len;
             let (header, payload) = seg.split_at_mut(header_len);
             match keys.packet.decrypt_in_place(number, header, payload) {
                 Ok(_) => {
-                    self.largest = self.largest.max(number);
+                    *largest = (*largest).max(number);
                     self.opened += 1;
                 }
                 Err(_) => {

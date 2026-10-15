@@ -76,6 +76,9 @@ pub trait AsyncUdpSocket: Send + Sync + Debug + 'static {
     /// The keys a decrypting receive thread opens packets with
     fn set_recv_keys(&self, _keys: proto::RecvKeys) {}
 
+    /// Forget the receive keys given for the connection the peer reaches at `cid`
+    fn clear_recv_keys(&self, _cid: proto::ConnectionId) {}
+
     /// Hand `buf[..len]`, sent as `meta` describes (its contents ignored), and
     /// the packets in it still to seal, to the send thread. On success `buf` and
     /// `seals` are swapped for empty ones from the thread's pool; on

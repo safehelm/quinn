@@ -137,6 +137,8 @@ pub struct Connection {
     crypto: Box<dyn crypto::Session>,
     /// The CID we initially chose, for use during the handshake
     handshake_cid: ConnectionId,
+    /// The CID the peer addressed its last authenticated data packet to
+    rx_dcid: ConnectionId,
     /// The CID the peer initially chose, for use during the handshake
     rem_handshake_cid: ConnectionId,
     /// The "real" local IP address which was was used to receive the initial packet.
@@ -285,6 +287,7 @@ impl Connection {
             endpoint_config,
             crypto,
             handshake_cid: loc_cid,
+            rx_dcid: loc_cid,
             rem_handshake_cid: rem_cid,
             local_cid_state: CidState::new(
                 cid_gen.cid_len(),
@@ -2339,6 +2342,9 @@ impl Connection {
                 }
             }
             Ok((packet, number)) => {
+                if packet.header.space() == SpaceId::Data {
+                    self.rx_dcid = packet.header.dst_cid();
+                }
                 let span = match number {
                     Some(pn) => trace_span!("recv", space = ?packet.header.space(), pn),
                     None => trace_span!("recv", space = ?packet.header.space()),
@@ -4204,6 +4210,9 @@ pub struct RecvKeys {
     pub largest: u64,
     /// The length of this endpoint's connection IDs
     pub cid_len: usize,
+    /// The CID the peer sends to: packets carrying another are not this
+    /// connection's, and other connections may share the socket
+    pub dst_cid: ConnectionId,
 }
 
 impl fmt::Debug for RecvKeys {
@@ -4227,6 +4236,7 @@ impl Connection {
             key_phase: self.key_phase,
             largest: space.rx_packet,
             cid_len: self.handshake_cid.len(),
+            dst_cid: self.rx_dcid,
         })
     }
 }
