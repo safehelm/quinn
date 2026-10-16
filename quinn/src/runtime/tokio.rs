@@ -6,7 +6,7 @@ use std::{
     net::{IpAddr, SocketAddr},
     pin::Pin,
     sync::{
-        Arc, Condvar, Mutex,
+        Arc, Condvar, Mutex, OnceLock,
         atomic::{AtomicUsize, Ordering},
         mpsc,
     },
@@ -19,7 +19,75 @@ use tokio::{
     time::{Sleep, sleep_until},
 };
 
+use rayon::prelude::*;
+
 use super::{AsyncTimer, AsyncUdpSocket, Runtime, UdpPollHelper};
+
+/// The threads that seal and open one batch's packets at once, beside the
+/// send and receive threads: QUINN_CRYPTO_THREADS of them (the machine's
+/// cores when unset, none at 1). A batch of fewer than QUINN_CRYPTO_MIN
+/// packets (4) is sealed or opened on the thread that holds it. The packets
+/// of a batch are still sent, and handed on, in the order they were built
+/// and received: a reordered packet reads to QUIC as one lost.
+struct CryptoPool {
+    pool: Option<rayon::ThreadPool>,
+    min: usize,
+}
+
+fn crypto_pool() -> &'static CryptoPool {
+    static POOL: OnceLock<CryptoPool> = OnceLock::new();
+    POOL.get_or_init(|| {
+        let var = |k: &str| std::env::var(k).ok().and_then(|v| v.parse::<usize>().ok());
+        let threads = var("QUINN_CRYPTO_THREADS")
+            .or_else(|| std::thread::available_parallelism().ok().map(|n| n.get()))
+            .unwrap_or(1);
+        let pool = (threads > 1)
+            .then(|| {
+                rayon::ThreadPoolBuilder::new()
+                    .num_threads(threads)
+                    .thread_name(|i| format!("quinn-crypto-{i}"))
+                    .build()
+                    .ok()
+            })
+            .flatten();
+        CryptoPool {
+            pool,
+            min: var("QUINN_CRYPTO_MIN").filter(|&n| n > 0).unwrap_or(4),
+        }
+    })
+}
+
+/// `f` on each item, across the pool when there are enough of them
+fn each_in_pool<T: Send>(items: &mut [T], f: impl Fn(&mut T) + Sync + Send) {
+    let c = crypto_pool();
+    match &c.pool {
+        Some(pool) if items.len() >= c.min => pool.install(|| items.par_iter_mut().for_each(f)),
+        _ => items.iter_mut().for_each(f),
+    }
+}
+
+/// Seal every packet of one transmit, each in its own bytes of `buf`
+fn seal_all(seals: &[proto::SealJob], buf: &mut [u8]) {
+    let in_order = seals.windows(2).all(|w| w[0].range().end <= w[1].range().start);
+    if !in_order || seals.len() < 2 {
+        for s in seals {
+            s.seal(buf);
+        }
+        return;
+    }
+    let mut parts = Vec::with_capacity(seals.len());
+    let mut rest = buf;
+    let mut at = 0;
+    for s in seals {
+        let r = s.range();
+        let (_, tail) = mem::take(&mut rest).split_at_mut(r.start - at);
+        let (packet, tail) = tail.split_at_mut(r.end - r.start);
+        parts.push((s, packet));
+        rest = tail;
+        at = r.end;
+    }
+    each_in_pool(&mut parts, |(s, packet)| s.seal_packet(packet));
+}
 
 /// A Quinn runtime for Tokio
 #[derive(Debug)]
@@ -255,9 +323,7 @@ impl SendThread {
                         }
                         Err(_) => return,
                     };
-                    for s in &job.seals {
-                        s.seal(&mut job.buf);
-                    }
+                    seal_all(&job.seals, &mut job.buf);
                     let t = udp::Transmit {
                         destination: job.destination,
                         ecn: job.ecn,
@@ -385,11 +451,19 @@ impl RecvThread {
                     if me.decrypt {
                         let keys = me.keys.lock().unwrap().clone();
                         if !keys.is_empty() {
-                            for i in 0..b.n {
-                                let m = &mut b.metas[i];
-                                let off = i * RECV_CHUNK;
-                                m.predecrypted =
-                                    opener.open(&keys, &mut b.buf[off..off + m.len], m.stride);
+                            let mut pending = Vec::with_capacity(b.n);
+                            for (chunk, m) in
+                                b.buf.chunks_mut(RECV_CHUNK).zip(b.metas.iter_mut()).take(b.n)
+                            {
+                                let opened = opener.prepare(&keys, &mut chunk[..m.len], m.stride);
+                                m.predecrypted = opened.is_some();
+                                pending.extend(opened);
+                            }
+                            let mut items: Vec<&mut OpenItem<'_>> =
+                                pending.iter_mut().flat_map(|p| p.items.iter_mut()).collect();
+                            each_in_pool(&mut items, |it| it.open());
+                            for p in pending {
+                                opener.finish(p);
                             }
                         }
                     }
@@ -458,22 +532,48 @@ struct Opener {
     opened: u64,
 }
 
+/// One 1-RTT packet to open in place: its number, its header's length and
+/// its bytes, and whether it opened
+struct OpenItem<'a> {
+    key: Arc<dyn proto::crypto::PacketKey>,
+    number: u64,
+    header_len: usize,
+    seg: &'a mut [u8],
+    ok: bool,
+}
+
+impl OpenItem<'_> {
+    fn open(&mut self) {
+        let (header, payload) = self.seg.split_at_mut(self.header_len);
+        self.ok = self.key.decrypt_in_place(self.number, header, payload).is_ok();
+    }
+}
+
+/// The packets of one datagram, their headers unprotected, to be opened
+struct Prepared<'a> {
+    pn_offset: usize,
+    items: Vec<OpenItem<'a>>,
+}
+
 impl Opener {
-    /// Opens every segment of one datagram in place, or none: true when it did.
-    /// A datagram is opened only with the keys of the connection its CID
-    /// names; any other is left exactly as it arrived, for the endpoint.
-    fn open(&mut self, all: &RecvKeyMap, dgram: &mut [u8], stride: usize) -> bool {
-        let Some(cid_len) = all.values().next().map(|k| k.cid_len) else {
-            return false;
-        };
+    /// Unprotects the header of every segment of one datagram and numbers each,
+    /// or touches none: `Some` when the datagram is to be opened. A datagram
+    /// is opened only with the keys of the connection its CID names; any other
+    /// is left exactly as it arrived, for the endpoint. The payloads are opened
+    /// afterwards ([`OpenItem::open`], in the pool) and [`Self::finish`]ed.
+    fn prepare<'a>(
+        &mut self,
+        all: &RecvKeyMap,
+        dgram: &'a mut [u8],
+        stride: usize,
+    ) -> Option<Prepared<'a>> {
+        let cid_len = all.values().next().map(|k| k.cid_len)?;
         let pn_offset = 1 + cid_len;
         if dgram.len() < pn_offset || dgram[0] & 0x80 != 0 {
-            return false;
+            return None;
         }
         let cid = proto::ConnectionId::new(&dgram[1..pn_offset]);
-        let Some(keys) = all.get(&cid) else {
-            return false;
-        };
+        let keys = all.get(&cid)?;
         let stride = if stride == 0 { dgram.len() } else { stride };
         // A GRO train is one 5-tuple, but say so before touching any of it
         let first = &dgram[1..pn_offset];
@@ -481,32 +581,11 @@ impl Opener {
             .chunks(stride)
             .any(|seg| seg.len() < pn_offset || seg[1..pn_offset] != *first)
         {
-            return false;
+            return None;
         }
         if self.numbers.len() > 2 * all.len() + 16 {
             self.numbers.retain(|c, _| all.contains_key(c));
         }
-        let key = Arc::as_ptr(&keys.packet) as *const () as usize;
-        let state = self.numbers.entry(cid).or_insert((0, 0));
-        if state.0 != key {
-            *state = (key, state.1.max(keys.largest));
-        }
-        let mut largest = state.1;
-        let opened = self.open_with(keys, &mut largest, dgram, stride, pn_offset);
-        if let Some(state) = self.numbers.get_mut(&cid) {
-            state.1 = largest;
-        }
-        opened
-    }
-
-    fn open_with(
-        &mut self,
-        keys: &proto::RecvKeys,
-        largest: &mut u64,
-        dgram: &mut [u8],
-        stride: usize,
-        pn_offset: usize,
-    ) -> bool {
         let min = pn_offset + 4 + keys.header.sample_size();
         // Pass 1: every segment a short header of the current phase, or none touched
         let mut unprotected = 0;
@@ -527,37 +606,53 @@ impl Opener {
             for seg in dgram.chunks_mut(stride).take(unprotected) {
                 keys.header.encrypt(pn_offset, seg);
             }
-            return false;
+            return None;
         }
-        // Pass 2: decrypt each
+        // Pass 2: each packet's number, in order. The largest is taken as if
+        // each opens, so that the next datagram of this batch is numbered from
+        // it; a packet that fails is one QUIC sends again
+        let key = Arc::as_ptr(&keys.packet) as *const () as usize;
+        let state = self.numbers.entry(cid).or_insert((0, 0));
+        if state.0 != key {
+            *state = (key, state.1.max(keys.largest));
+        }
+        let mut items = Vec::with_capacity(dgram.len().div_ceil(stride));
         for seg in dgram.chunks_mut(stride) {
             let pn_len = (seg[0] & 0x03) as usize + 1;
             let mut truncated = 0u64;
             for &b in &seg[pn_offset..pn_offset + pn_len] {
                 truncated = (truncated << 8) | u64::from(b);
             }
-            let number = expand_pn(truncated, pn_len, *largest + 1);
-            let header_len = pn_offset + pn_len;
-            let (header, payload) = seg.split_at_mut(header_len);
-            match keys.packet.decrypt_in_place(number, header, payload) {
-                Ok(_) => {
-                    *largest = (*largest).max(number);
-                    self.opened += 1;
-                }
-                Err(_) => {
-                    // Routed nowhere, so lost; QUIC sends it again
-                    header[1..pn_offset].fill(0);
-                    self.failed += 1;
-                    if self.failed.is_power_of_two() {
-                        eprintln!(
-                            "quinn-recv: {} packets failed to open, {} opened",
-                            self.failed, self.opened
-                        );
-                    }
-                }
+            let number = expand_pn(truncated, pn_len, state.1 + 1);
+            state.1 = state.1.max(number);
+            items.push(OpenItem {
+                key: keys.packet.clone(),
+                number,
+                header_len: pn_offset + pn_len,
+                seg,
+                ok: false,
+            });
+        }
+        Some(Prepared { pn_offset, items })
+    }
+
+    /// Counts what opened, and makes each packet that did not unroutable
+    fn finish(&mut self, p: Prepared<'_>) {
+        for it in p.items {
+            if it.ok {
+                self.opened += 1;
+                continue;
+            }
+            // Routed nowhere, so lost; QUIC sends it again
+            it.seg[1..p.pn_offset].fill(0);
+            self.failed += 1;
+            if self.failed.is_power_of_two() {
+                eprintln!(
+                    "quinn-recv: {} packets failed to open, {} opened",
+                    self.failed, self.opened
+                );
             }
         }
-        true
     }
 }
 

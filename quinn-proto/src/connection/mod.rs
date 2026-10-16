@@ -4169,7 +4169,16 @@ pub struct SealJob {
 impl SealJob {
     /// Seal the packet in `buf`, the buffer of the transmit it was built in
     pub fn seal(&self, buf: &mut [u8]) {
-        let p = &mut buf[self.start..self.end];
+        self.seal_packet(&mut buf[self.start..self.end]);
+    }
+
+    /// Where the packet is in its transmit's buffer
+    pub fn range(&self) -> std::ops::Range<usize> {
+        self.start..self.end
+    }
+
+    /// Seal the packet given its own bytes, `buf[self.range()]`
+    pub fn seal_packet(&self, p: &mut [u8]) {
         self.packet.encrypt(self.number, p, self.header_len);
         self.header.encrypt(self.pn_pos, p);
     }
