@@ -2299,6 +2299,40 @@ fn datagram_send_recv() {
     assert_matches!(pair.server_datagrams(server_ch).recv(), None);
 }
 
+/// A 1-RTT packet the client sends right after its last handshake flight, overtaking that flight on
+/// the path, is kept until the handshake completes rather than discarded: a DATAGRAM in it is never
+/// sent again, so a discard loses it for good
+#[test]
+fn datagram_overtaking_client_finished() {
+    let _guard = subscribe();
+    let mut pair = Pair::default();
+    let client_ch = pair.begin_connect(client_config());
+    pair.drive_client();
+    pair.drive_server();
+    pair.drive_client();
+    let flight = pair.server.inbound.len();
+    assert!(flight > 0);
+
+    const DATA: &[u8] = b"auth";
+    pair.client_datagrams(client_ch)
+        .send(DATA.into(), true)
+        .unwrap();
+    pair.drive_client();
+    assert_eq!(pair.server.inbound.len(), flight + 1);
+    let one_rtt = pair.server.inbound.pop_back().unwrap();
+    assert_eq!(one_rtt.2[0] & packet::LONG_HEADER_FORM, 0, "a 1-RTT packet alone");
+    pair.server.inbound.push_front(one_rtt);
+
+    pair.drive();
+    let server_ch = pair.server.assert_accept();
+    let mut received = false;
+    while let Some(event) = pair.server_conn_mut(server_ch).poll() {
+        received |= matches!(event, Event::DatagramReceived);
+    }
+    assert!(received, "the DATAGRAM that overtook the handshake was lost");
+    assert_eq!(pair.server_datagrams(server_ch).recv().unwrap(), DATA);
+}
+
 #[test]
 fn datagram_recv_buffer_overflow() {
     let _guard = subscribe();
