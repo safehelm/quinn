@@ -2103,7 +2103,9 @@ fn handshake_1rtt_handling() {
 
     pair.drive();
 
-    assert!(pair.client_conn_mut(client_ch).stats().path.lost_packets != 0);
+    // The 1-RTT data that arrived first is kept until the handshake completes, not dropped and
+    // sent again
+    assert_eq!(pair.client_conn_mut(client_ch).stats().path.lost_packets, 0);
     let mut recv = pair.server_recv(server_ch, s);
     let mut chunks = recv.read(false).unwrap();
     assert_matches!(
@@ -2320,7 +2322,11 @@ fn datagram_overtaking_client_finished() {
     pair.drive_client();
     assert_eq!(pair.server.inbound.len(), flight + 1);
     let one_rtt = pair.server.inbound.pop_back().unwrap();
-    assert_eq!(one_rtt.2[0] & packet::LONG_HEADER_FORM, 0, "a 1-RTT packet alone");
+    assert_eq!(
+        one_rtt.2[0] & packet::LONG_HEADER_FORM,
+        0,
+        "a 1-RTT packet alone"
+    );
     pair.server.inbound.push_front(one_rtt);
 
     pair.drive();
@@ -2329,7 +2335,10 @@ fn datagram_overtaking_client_finished() {
     while let Some(event) = pair.server_conn_mut(server_ch).poll() {
         received |= matches!(event, Event::DatagramReceived);
     }
-    assert!(received, "the DATAGRAM that overtook the handshake was lost");
+    assert!(
+        received,
+        "the DATAGRAM that overtook the handshake was lost"
+    );
     assert_eq!(pair.server_datagrams(server_ch).recv().unwrap(), DATA);
 }
 

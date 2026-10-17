@@ -202,6 +202,10 @@ pub struct Connection {
     timers: TimerTable,
     /// Number of packets received which could not be authenticated
     authentication_failures: u64,
+    /// 1-RTT packets received while the handshake was still in progress, stored as received and
+    /// handled once it completes (RFC 9001 section 5.7): the peer's last handshake flight can be
+    /// overtaken on the path by the packets it sent right after it
+    early_1rtt: Vec<(SocketAddr, Option<EcnCodepoint>, Packet)>,
     /// Why the connection was lost, if it has been
     error: Option<ConnectionError>,
     /// Identifies Data-space packet numbers to skip. Not used in earlier spaces.
@@ -332,6 +336,7 @@ impl Connection {
             },
             timers: TimerTable::default(),
             authentication_failures: 0,
+            early_1rtt: Vec::new(),
             error: None,
             #[cfg(test)]
             packet_number_filter: match config.deterministic_packet_numbers {
@@ -2292,6 +2297,18 @@ impl Connection {
         stateless_reset: bool,
     ) {
         self.stats.udp_rx.ios += 1;
+        self.handle_packet_inner(now, remote, ecn, packet, stateless_reset);
+        self.handle_early_1rtt(now);
+    }
+
+    fn handle_packet_inner(
+        &mut self,
+        now: Instant,
+        remote: SocketAddr,
+        ecn: Option<EcnCodepoint>,
+        packet: Option<Packet>,
+        stateless_reset: bool,
+    ) {
         if let Some(ref packet) = packet {
             trace!(
                 "got {:?} packet ({} bytes) from {} using id {}",
@@ -2304,6 +2321,23 @@ impl Connection {
 
         if self.is_handshaking() && remote != self.path.remote {
             debug!("discarding packet with unexpected remote during handshake");
+            return;
+        }
+
+        // RFC 9001 section 5.7: a server does not process a 1-RTT packet before the handshake
+        // is complete, and may store it to decrypt and use once it is. Stored, rather than
+        // discarded, up to MAX_EARLY_1RTT a connection: what such a packet carries may never be
+        // sent again, as a DATAGRAM is not
+        if !stateless_reset
+            && self.state.is_handshake()
+            && packet.as_ref().is_some_and(|p| p.header.is_short())
+        {
+            if self.early_1rtt.len() < MAX_EARLY_1RTT {
+                trace!("storing short packet received during handshake");
+                self.early_1rtt.push((remote, ecn, packet.unwrap()));
+            } else {
+                trace!("dropping short packet during handshake");
+            }
             return;
         }
 
@@ -2356,7 +2390,7 @@ impl Connection {
                     debug!("discarding possible duplicate packet");
                     return;
                 } else if self.state.is_handshake() && packet.header.is_short() {
-                    // TODO: SHOULD buffer these to improve reordering tolerance.
+                    // Stored above; here only when a stateless reset was suspected
                     trace!("dropping short packet during handshake");
                     return;
                 } else {
@@ -2436,6 +2470,29 @@ impl Connection {
         // Transmit CONNECTION_CLOSE if necessary
         if let State::Closed(_) = self.state {
             self.close = remote == self.path.remote;
+        }
+    }
+
+    /// Handles the 1-RTT packets stored during the handshake, in the order they arrived, once
+    /// it has completed, each as if it had just been received; a connection that closed meanwhile
+    /// drops them
+    fn handle_early_1rtt(&mut self, now: Instant) {
+        if self.state.is_handshake() || self.early_1rtt.is_empty() {
+            return;
+        }
+        let early = mem::take(&mut self.early_1rtt);
+        if !matches!(self.state, State::Established) {
+            return;
+        }
+        trace!(
+            count = early.len(),
+            "handling short packets stored during handshake"
+        );
+        for (remote, ecn, packet) in early {
+            self.handle_packet_inner(now, remote, ecn, Some(packet), false);
+            if !matches!(self.state, State::Established) {
+                return;
+            }
         }
     }
 
@@ -4087,6 +4144,10 @@ const MAX_HANDSHAKE_OR_0RTT_HEADER_SIZE: usize =
 ///
 /// Chosen arbitrarily, intended to be large enough to prevent spurious connection loss.
 const KEY_UPDATE_MARGIN: u64 = 10_000;
+
+/// 1-RTT packets stored while the handshake is in progress; beyond these, they are dropped
+/// (quic-go stores 32)
+const MAX_EARLY_1RTT: usize = 16;
 
 #[derive(Default)]
 struct SentFrames {
