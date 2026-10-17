@@ -474,8 +474,20 @@ impl Connection {
     ///
     /// [`send_datagram()`]: Connection::send_datagram
     pub fn send_datagram_wait(&self, data: Bytes) -> SendDatagram<'_> {
+        self.send_datagram_parts_wait(Bytes::new(), data)
+    }
+
+    /// Transmit `head` then `data` as one unreliable, unordered application datagram
+    ///
+    /// As [`send_datagram_wait()`], with the datagram in two parts, neither copied until its
+    /// packet is built: a relay that rewrites a message's header sends the new header and a
+    /// slice of what it received.
+    ///
+    /// [`send_datagram_wait()`]: Connection::send_datagram_wait
+    pub fn send_datagram_parts_wait(&self, head: Bytes, data: Bytes) -> SendDatagram<'_> {
         SendDatagram {
             conn: &self.0,
+            head,
             data: Some(data),
             notify: self.0.shared.datagrams_unblocked.notified(),
         }
@@ -845,6 +857,7 @@ pin_project! {
     /// Future produced by [`Connection::send_datagram_wait`]
     pub struct SendDatagram<'a> {
         conn: &'a ConnectionRef,
+        head: Bytes,
         data: Option<Bytes>,
         #[pin]
         notify: Notified<'a>,
@@ -860,11 +873,11 @@ impl Future for SendDatagram<'_> {
             return Poll::Ready(Err(SendDatagramError::ConnectionLost(e.clone())));
         }
         use proto::SendDatagramError::*;
-        match state
-            .inner
-            .datagrams()
-            .send(this.data.take().unwrap(), false)
-        {
+        match state.inner.datagrams().send_parts(
+            this.head.clone(),
+            this.data.take().unwrap(),
+            false,
+        ) {
             Ok(()) => {
                 state.wake();
                 Poll::Ready(Ok(()))

@@ -2301,6 +2301,30 @@ fn datagram_send_recv() {
     assert_matches!(pair.server_datagrams(server_ch).recv(), None);
 }
 
+#[test]
+fn datagram_parts_arrive_as_one() {
+    let _guard = subscribe();
+    let mut pair = Pair::default();
+    let (client_ch, server_ch) = pair.connect();
+    pair.client_datagrams(client_ch)
+        .send_parts(
+            Bytes::from_static(b"head "),
+            Bytes::from_static(b"tail"),
+            true,
+        )
+        .unwrap();
+    pair.drive();
+    assert_matches!(
+        pair.server_conn_mut(server_ch).poll(),
+        Some(Event::DatagramReceived)
+    );
+    assert_eq!(
+        pair.server_datagrams(server_ch).recv().unwrap(),
+        &b"head tail"[..]
+    );
+    assert_matches!(pair.server_datagrams(server_ch).recv(), None);
+}
+
 /// A 1-RTT packet the client sends right after its last handshake flight, overtaking that flight on
 /// the path, is kept until the handshake completes rather than discarded: a DATAGRAM in it is never
 /// sent again, so a discard loses it for good

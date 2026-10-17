@@ -709,6 +709,7 @@ impl Iter {
                     })
                 } else if let Some(d) = ty.datagram() {
                     Frame::Datagram(Datagram {
+                        head: Bytes::new(),
                         data: if d.len() {
                             self.take_len()?
                         } else {
@@ -896,6 +897,9 @@ pub(crate) const RETIRE_CONNECTION_ID_SIZE_BOUND: usize = 9;
 pub struct Datagram {
     /// Payload
     pub data: Bytes,
+    /// Sent before `data`, as the same datagram (`Datagrams::send_parts`); empty on a received
+    /// datagram
+    pub(crate) head: Bytes,
 }
 
 impl FrameStruct for Datagram {
@@ -907,17 +911,23 @@ impl Datagram {
         out.write(FrameType(*DATAGRAM_TYS.start() | u64::from(length))); // 1 byte
         if length {
             // Safe to unwrap because we check length sanity before queueing datagrams
-            out.write(VarInt::from_u64(self.data.len() as u64).unwrap()); // <= 8 bytes
+            out.write(VarInt::from_u64(self.len() as u64).unwrap()); // <= 8 bytes
         }
+        out.extend_from_slice(&self.head);
         out.extend_from_slice(&self.data);
     }
 
     pub(crate) fn size(&self, length: bool) -> usize {
         1 + if length {
-            VarInt::from_u64(self.data.len() as u64).unwrap().size()
+            VarInt::from_u64(self.len() as u64).unwrap().size()
         } else {
             0
-        } + self.data.len()
+        } + self.len()
+    }
+
+    /// The datagram's length on the wire, both parts
+    pub(crate) fn len(&self) -> usize {
+        self.head.len() + self.data.len()
     }
 }
 

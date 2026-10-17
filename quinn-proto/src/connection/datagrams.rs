@@ -26,6 +26,21 @@ impl Datagrams<'_> {
     ///
     /// Returns `Err` iff a `len`-byte datagram cannot currently be sent.
     pub fn send(&mut self, data: Bytes, drop: bool) -> Result<(), SendDatagramError> {
+        self.send_parts(Bytes::new(), data, drop)
+    }
+
+    /// Queue `head` then `data` as one datagram, neither copied until its packet is built
+    ///
+    /// As `send`, with the datagram in two parts: a relay that rewrites a message's header
+    /// sends the new header and a slice of what it received. `Blocked` returns `data` alone;
+    /// a caller that retries keeps `head`.
+    pub fn send_parts(
+        &mut self,
+        head: Bytes,
+        data: Bytes,
+        drop: bool,
+    ) -> Result<(), SendDatagramError> {
+        let len = head.len() + data.len();
         if self.conn.config.datagram_receive_buffer_size.is_none() {
             return Err(SendDatagramError::Disabled);
         }
@@ -36,22 +51,23 @@ impl Datagrams<'_> {
         let Some(max_buffer_payload) = send_buffer_size.checked_sub(size_of::<Datagram>()) else {
             return Err(SendDatagramError::TooLarge);
         };
-        if data.len() > Ord::min(max, max_buffer_payload) {
+        if len > Ord::min(max, max_buffer_payload) {
             return Err(SendDatagramError::TooLarge);
         }
         if drop {
-            self.conn
-                .datagrams
-                .make_space_for(data.len(), send_buffer_size);
+            self.conn.datagrams.make_space_for(len, send_buffer_size);
         } else if !self
             .conn
             .datagrams
-            .has_send_buffer_space(data.len(), send_buffer_size)
+            .has_send_buffer_space(len, send_buffer_size)
         {
             self.conn.datagrams.send_blocked = true;
             return Err(SendDatagramError::Blocked(data));
         }
-        self.conn.datagrams.outgoing.push_back(Datagram { data });
+        self.conn
+            .datagrams
+            .outgoing
+            .push_back(Datagram { head, data });
         Ok(())
     }
 
@@ -135,7 +151,7 @@ impl DatagramState {
             Some(x) => *x,
         };
 
-        let size_with_overhead = datagram.data.len() + size_of::<Datagram>();
+        let size_with_overhead = datagram.len() + size_of::<Datagram>();
 
         if size_with_overhead > window {
             return Err(TransportError::PROTOCOL_VIOLATION("oversized datagram"));
@@ -156,7 +172,7 @@ impl DatagramState {
             let Some(prev) = self.outgoing.pop_front() else {
                 break;
             };
-            trace!(len = prev.data.len(), "dropping outgoing datagram");
+            trace!(len = prev.len(), "dropping outgoing datagram");
         }
     }
 
@@ -182,14 +198,14 @@ impl DatagramState {
     pub(super) fn drop_oversized(&mut self, max_payload: usize) -> bool {
         let mut dropped_any = false;
         self.outgoing.queue.retain(|datagram| {
-            let result = datagram.data.len() <= max_payload;
+            let result = datagram.len() <= max_payload;
             if !result {
                 trace!(
                     "dropping {} byte datagram violating {} byte limit",
-                    datagram.data.len(),
+                    datagram.len(),
                     max_payload
                 );
-                self.outgoing.payload_bytes -= datagram.data.len();
+                self.outgoing.payload_bytes -= datagram.len();
                 dropped_any = true;
             }
             result
@@ -214,7 +230,7 @@ impl DatagramState {
             return false;
         }
 
-        trace!(len = datagram.data.len(), "DATAGRAM");
+        trace!(len = datagram.len(), "DATAGRAM");
         datagram.encode(true, buf);
         true
     }
@@ -233,18 +249,18 @@ pub(super) struct DatagramBuffer {
 
 impl DatagramBuffer {
     fn push_back(&mut self, datagram: Datagram) {
-        self.payload_bytes += datagram.data.len();
+        self.payload_bytes += datagram.len();
         self.queue.push_back(datagram);
     }
 
     fn pop_front(&mut self) -> Option<Datagram> {
         let datagram = self.queue.pop_front()?;
-        self.payload_bytes -= datagram.data.len();
+        self.payload_bytes -= datagram.len();
         Some(datagram)
     }
 
     fn push_front(&mut self, datagram: Datagram) {
-        self.payload_bytes += datagram.data.len();
+        self.payload_bytes += datagram.len();
         self.queue.push_front(datagram);
     }
 
@@ -270,9 +286,11 @@ mod tests {
     fn make_space_for_accounts_for_new_datagram() {
         let mut state = DatagramState::default();
         state.outgoing.push_back(Datagram {
+            head: Bytes::new(),
             data: Bytes::from_static(&[0; 7]),
         });
         state.outgoing.push_back(Datagram {
+            head: Bytes::new(),
             data: Bytes::from_static(&[0; 2]),
         });
         state.make_space_for(4, 10 + 2 * size_of::<Datagram>());
@@ -286,6 +304,7 @@ mod tests {
     fn make_space_for_handles_overflowing_capacity_check() {
         let mut state = DatagramState::default();
         state.outgoing.queue.push_back(Datagram {
+            head: Bytes::new(),
             data: Bytes::from_static(&[0]),
         });
         state.outgoing.payload_bytes = usize::MAX - 1;
@@ -300,7 +319,10 @@ mod tests {
     fn make_space_for_accounts_for_empty_datagram_metadata() {
         let mut state = DatagramState::default();
         for _ in 0..2 {
-            state.outgoing.push_back(Datagram { data: Bytes::new() });
+            state.outgoing.push_back(Datagram {
+                head: Bytes::new(),
+                data: Bytes::new(),
+            });
         }
         let window = 2 * size_of::<Datagram>();
 
@@ -308,7 +330,10 @@ mod tests {
         state.make_space_for(0, window);
         assert_eq!(state.outgoing.queue.len(), 1);
         assert!(state.has_send_buffer_space(0, window));
-        state.outgoing.push_back(Datagram { data: Bytes::new() });
+        state.outgoing.push_back(Datagram {
+            head: Bytes::new(),
+            data: Bytes::new(),
+        });
         assert_eq!(state.outgoing.memory_used(), window);
     }
 
@@ -321,9 +346,11 @@ mod tests {
     fn drop_oversized_keeps_datagrams_at_limit() {
         let mut state = DatagramState::default();
         state.outgoing.push_back(Datagram {
+            head: Bytes::new(),
             data: Bytes::from_static(&[0; 10]),
         });
         state.outgoing.push_back(Datagram {
+            head: Bytes::new(),
             data: Bytes::from_static(&[0; 11]),
         });
 
